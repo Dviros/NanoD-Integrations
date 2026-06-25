@@ -14,19 +14,17 @@ Connection parameters: **115200 baud, 8 data bits, no parity, 1 stop bit**.
 
 Each JSON message is a single line terminated by `\n`. Newlines within field values must be escaped as `\n`. Partial frames are discarded after a 50 ms read timeout.
 
-### WebSocket (WiFi build only)
+### TCP (WiFi build only)
 
-When the firmware is built with the `WIFI_ENABLED` flag (`nanofoc_d_wifi` or `nanofoc_d_full` PlatformIO environments), the device runs an `AsyncWebServer` on port 80 with a WebSocket endpoint at `/ws`. The WebSocket transport mirrors the serial JSON API exactly: the same command and event JSON messages are used, and ACKs are returned over the same WebSocket connection that sent the command.
+When the firmware is built with the `WIFI_ENABLED` flag (`nanofoc_d_wifi` or `nanofoc_d_full` PlatformIO environments), the device runs a raw TCP JSON server on **port 3333** (`WifiThread::TCP_PORT`). The TCP transport mirrors the serial JSON API exactly: the same newline-delimited JSON messages, commands, events, and ACKs are used. Up to `MAX_TCP_CLIENTS` (4) simultaneous connections are accepted. Inbound lines longer than `MAX_LINE_BYTES` (2048 bytes) are silently dropped.
 
-When a WebSocket client connects, the device sends an initial greeting:
+When a TCP client connects, the device sends an initial greeting:
 
 ```json
 { "connected": true, "ip": "192.168.1.42", "device": "Nano_3053f07554dc", "fw": "1.0.0" }
 ```
 
-A simple status endpoint is also available over HTTP GET `/status` returning device IP, RSSI, name, and firmware version.
-
-An HTTP firmware OTA upload endpoint is available at `/update` (multipart POST). Append `.spiffs` to the filename to target the filesystem partition instead of the application partition.
+All outbound frames (ACKs, events, replies) produced by `com_thread.emit()` are mirrored to every connected TCP client via a FreeRTOS queue that `wifi_thread` drains each loop iteration. ArduinoOTA remains available for over-the-air firmware updates once the device is connected to a station network.
 
 ---
 
@@ -520,7 +518,7 @@ This section describes how an external application (a script, desktop app, or au
 
 **Serial:** Open the device's USB-CDC port at 115200 baud 8N1. The device identifies itself by USB VID/PID; known pairs are `239A:8010` and `303A:1001`. On connection the device emits `{"ack":"boot","ok":true}` and immediately dispatches the current settings and profile configuration.
 
-**WebSocket (WiFi build):** Connect to `ws://<device-ip>/ws`. On connect the device emits a greeting object. The same JSON messages are used.
+**TCP (WiFi build):** Open a raw TCP connection to `<device-ip>:3333`. On connect the device emits a greeting object. The same newline-delimited JSON messages are used.
 
 ### Receiving events
 
@@ -555,7 +553,7 @@ The device does not auto-save. Call `{"save":true}` explicitly after any changes
 ### Typical integration sequence
 
 ```
-1. Open port / connect WebSocket
+1. Open port / connect to <device-ip>:3333 (TCP)
 2. Receive {"ack":"boot","ok":true}
 3. Query profiles: send {"profiles":"#all"}
 4. Receive {"profiles":[...],"current":"..."}
@@ -566,9 +564,9 @@ The device does not auto-save. Call `{"save":true}` explicitly after any changes
 9. Receive {"saved":true} and {"ack":"save","ok":true}
 ```
 
-### WiFi build: WebSocket relay architecture
+### WiFi build: TCP transport architecture
 
-In the `WIFI_ENABLED` build, inbound WebSocket commands are relayed to the serial parser in `com_thread`. The `wifi` command is handled directly by `wifi_thread` and does not pass through serial. All other commands are written back to the USB-CDC UART so `com_thread` processes them identically to serial input. Outbound serial JSON is not currently mirrored back to WebSocket clients automatically (tracked as a known limitation); ACKs and events observed over serial are not duplicated to WebSocket in the current implementation.
+In the `WIFI_ENABLED` build, inbound TCP lines are forwarded to `com_thread` via a FreeRTOS queue (`net_submit()`); `com_thread` parses them identically to serial input. All outbound frames — ACKs, events, and replies — pass through `com_thread.emit()`, which enqueues a heap copy to the net-out queue that `wifi_thread` drains each loop iteration and sends to every connected TCP client. The serial and TCP paths share a single emit point; no frames are missed on either transport.
 
 ---
 
@@ -583,7 +581,7 @@ The firmware uses the STUSB4500 USB-PD controller to negotiate power. On boot, `
 | PlatformIO environment | WiFi | Audio | Notes |
 |------------------------|------|-------|-------|
 | `nanofoc_d` | no | no | Default; safe core only |
-| `nanofoc_d_wifi` | yes | no | Adds WebSocket transport |
+| `nanofoc_d_wifi` | yes | no | Adds raw TCP JSON transport on port 3333 |
 | `nanofoc_d_audio` | no | yes | Audio click/chime feedback |
 | `nanofoc_d_full` | yes | yes | All features |
 
