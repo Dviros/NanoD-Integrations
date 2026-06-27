@@ -31,9 +31,11 @@ import zlib
 import numpy as np
 from PIL import Image
 
+from nowplaying import get_nowplaying
+
 _HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nowplaying-art")
 _DIM = 240                 # device screen
-_CHUNK = 512               # raw bytes per sprite chunk
+_CHUNK = 128               # raw bytes/chunk — keeps each JSON line under the ~256 B USB-CDC RX buffer
 _NAME = "art.rgb565"
 
 
@@ -96,36 +98,90 @@ def _dominant(img, n):
 
 # ── sprite upload + ring ───────────────────────────────────────────────────────
 
-def _upload(send_line_fn, data):
+# fh is the bridge's raw non-blocking read+write port handle. Lock-step
+# (write a line, wait for its ack) is REQUIRED for reliability: fire-and-forget
+# overruns the tiny CDC RX buffer and the upload aborts "size mismatch".
+
+def _send(fh, obj):
+    fh.write((json.dumps(obj) + "\n").encode())
+
+
+def _read_ack(fh, timeout=1.5):
+    buf = b""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            d = fh.read(4096)
+        except (BlockingIOError, OSError):
+            d = None
+        if d:
+            buf += d
+            for ln in buf.split(b"\n"):
+                if b'"ack"' in ln:
+                    try:
+                        return json.loads(ln)
+                    except ValueError:
+                        pass
+        else:
+            time.sleep(0.002)
+    return None
+
+
+def _write_all(fh, data):
+    """Write all bytes to the non-blocking port, flow-controlled by the device."""
+    mv = memoryview(data)
+    off = 0
+    while off < len(data):
+        try:
+            n = fh.write(mv[off:])
+        except (BlockingIOError, OSError):
+            n = 0
+        if n:
+            off += n
+        else:
+            time.sleep(0.001)   # OS buffer full — device still draining; back off
+
+
+def _upload(fh, data):
+    """Reliable base64 lock-step upload (~13 s). The binary fast-path is WIP — the
+    firmware's binReceiving drain doesn't pick up bytes that demonstrably reach the
+    line path (a TinyUSB-CDC quirk needing on-device serial-monitor debugging)."""
     crc = zlib.crc32(data) & 0xFFFFFFFF
-    send_line_fn(json.dumps({"sprite": {"op": "begin", "name": _NAME, "size": len(data)}}))
-    seq = 0
-    for off in range(0, len(data), _CHUNK):
-        chunk = data[off:off + _CHUNK]
-        send_line_fn(json.dumps({"sprite": {"op": "data", "seq": seq,
-                                            "data": base64.b64encode(chunk).decode("ascii")}}))
-        seq += 1
-        # ~115 KB = 225 chunks; pace lightly so the device's serial RX + LittleFS
-        # writes keep up (the whole frame is one upload per track change).
-        if seq % 24 == 0:
-            time.sleep(0.004)
-    send_line_fn(json.dumps({"sprite": {"op": "end", "name": _NAME, "crc32": crc}}))
-    send_line_fn(json.dumps({"sprite": {"op": "select", "name": _NAME}}))
+    _send(fh, {"sprite": {"op": "begin", "name": _NAME, "size": len(data)}})
+    if not (_read_ack(fh) or {}).get("ok"):
+        return False
+    for i, off in enumerate(range(0, len(data), _CHUNK)):
+        _send(fh, {"sprite": {"op": "data", "seq": i,
+                              "data": base64.b64encode(data[off:off + _CHUNK]).decode("ascii")}})
+        if not (_read_ack(fh) or {}).get("ok"):
+            return False
+    _send(fh, {"sprite": {"op": "end", "name": _NAME, "crc32": crc}})
+    if not (_read_ack(fh, 3) or {}).get("ok"):
+        return False
+    # Re-select even when the name is unchanged: deselect first so the firmware's
+    # activeSprite poll sees a change and re-streams the new frame.
+    _send(fh, {"sprite": {"op": "select", "name": ""}})
+    _read_ack(fh)
+    _send(fh, {"sprite": {"op": "select", "name": _NAME}})
+    _read_ack(fh)
+    return True
 
 
 # ── public API ─────────────────────────────────────────────────────────────────
 
-def push_artstream(send_line_fn, last={}, *, ring=True):  # noqa: B006 — persistent state
-    track_id, art = _now_playing()
-    if not track_id or not art:
+def push_artstream(fh, last={}, *, player="Music", ring=True):  # noqa: B006 — persistent state
+    info = get_nowplaying(player)
+    if not info:
         return False
+    track_id, art = info["track_id"], info["art"]
     if last.get("track_id") == track_id:
         return False
     try:
         data, cols = _render(art)
-        _upload(send_line_fn, data)
+        if not _upload(fh, data):
+            return False  # leave track_id uncached so it retries next poll
         if ring:
-            send_line_fn(json.dumps({"ring": {"primary": cols[0], "secondary": cols[1], "mode": 0}}))
+            _send(fh, {"ring": {"primary": cols[0], "secondary": cols[1], "mode": 0}})
         last["track_id"] = track_id
         return True
     finally:
@@ -135,8 +191,8 @@ def push_artstream(send_line_fn, last={}, *, ring=True):  # noqa: B006 — persi
             pass
 
 
-def clear_artstream(send_line_fn):
-    send_line_fn(json.dumps({"sprite": {"op": "select", "name": ""}}))
+def clear_artstream(fh):
+    _send(fh, {"sprite": {"op": "select", "name": ""}})
 
 
 # ── self-test: render a file to a .rgb565 + print colors (no device) ───────────

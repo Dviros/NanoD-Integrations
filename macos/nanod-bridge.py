@@ -49,6 +49,7 @@ DEFAULT_CONFIG = {
     "buttons": ["playpause", "next", "previous", "mute"],
     "knobVolume": True,
     "artwork": False,
+    "player": "Music",   # now-playing source: "Music" | "Spotify" | "<AppName>" (best-effort)
 }
 
 _config = dict(DEFAULT_CONFIG)
@@ -78,6 +79,8 @@ def _load_config() -> None:
             cfg["knobVolume"] = raw["knobVolume"]
         if isinstance(raw.get("artwork"), bool):
             cfg["artwork"] = raw["artwork"]
+        if isinstance(raw.get("player"), str) and raw["player"]:
+            cfg["player"] = raw["player"]
         _config = cfg
         _config_mtime = mtime
         print(f"[config] loaded: {cfg}", flush=True)
@@ -101,6 +104,29 @@ def osa(script: str) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+_VOLCTL_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "volctl")
+_volctl = None
+
+
+def set_volume(vol: int) -> None:
+    """Set output volume in ~1 ms via the persistent CoreAudio helper (real-time
+    knob feel — no per-change osascript spawn)."""
+    global _volctl
+    if _volctl is None or _volctl.poll() is not None:
+        try:
+            _volctl = subprocess.Popen([_VOLCTL_BIN], stdin=subprocess.PIPE,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            print(f"[vol] helper unavailable ({exc}); falling back to osascript", flush=True)
+            osa(f"set volume output volume {vol}")
+            return
+    try:
+        _volctl.stdin.write(f"{vol}\n".encode())
+        _volctl.stdin.flush()
+    except (BrokenPipeError, OSError):
+        _volctl = None  # respawn next call
 
 
 def media(verb: str) -> None:
@@ -196,9 +222,15 @@ def maybe_push_artwork(now: float) -> None:
         return
     _last_art_check = now
     try:
-        _push_artwork_impl(_artwork_send_line, last=_artwork_state)
+        # push_artstream drives the port directly (lock-step upload reading acks).
+        # The main loop is paused inside this call, so there's no read contention;
+        # knob/button events during the ~13 s upload are dropped (Phase 3 fixes speed).
+        t0 = time.time()
+        if _push_artwork_impl(_active_port, last=_artwork_state,
+                              player=get_config().get("player", "Music")):
+            print(f"[art] cover streamed in {time.time() - t0:.1f}s", flush=True)
     except Exception as exc:
-        print(f"[art] push_artwork error: {exc}", flush=True)
+        print(f"[art] push error: {exc}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +256,7 @@ def main() -> None:
     target_vol: int | None = None
     last_set: float = 0.0
     last_vol: int | None = None
-    THROTTLE = 0.035  # seconds between volume osascript calls
+    THROTTLE = 0.01  # CoreAudio helper is ~1 ms, so we can track the knob closely
 
     _active_port = None  # used by push_artwork stub
 
@@ -235,7 +267,7 @@ def main() -> None:
             continue
 
         try:
-            fh = open(port, "rb", buffering=0)
+            fh = open(port, "r+b", buffering=0)   # r+b: read events AND write art/ring
             fcntl.fcntl(fh, fcntl.F_SETFL, os.O_NONBLOCK)
             _active_port = fh
             print(f"[serial] connected: {port}", flush=True)
@@ -286,7 +318,7 @@ def main() -> None:
                     and target_vol != last_vol
                     and now - last_set > THROTTLE
                 ):
-                    osa(f"set volume output volume {target_vol}")
+                    set_volume(target_vol)   # ~1 ms CoreAudio — real-time knob
                     last_vol = target_vol
                     last_set = now
 
