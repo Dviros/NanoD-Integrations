@@ -35,7 +35,7 @@ from nowplaying import get_nowplaying
 
 _HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nowplaying-art")
 _DIM = 240                 # device screen
-_CHUNK = 128               # raw bytes/chunk — keeps each JSON line under the ~256 B USB-CDC RX buffer
+_CHUNK = 4096              # raw bytes per chunk-acked binary block (fits the device's 8 KB RX queue)
 _NAME = "art.rgb565"
 
 
@@ -142,19 +142,45 @@ def _write_all(fh, data):
             time.sleep(0.001)   # OS buffer full — device still draining; back off
 
 
+def _read_binack(fh, timeout=2.0):
+    """Wait for a {"binack":{...}} line; returns the inner object or None."""
+    buf = b""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            d = fh.read(4096)
+        except (BlockingIOError, OSError):
+            d = None
+        if d:
+            buf += d
+            for ln in buf.split(b"\n"):
+                if b'"binack"' in ln:
+                    try:
+                        return json.loads(ln).get("binack")
+                    except ValueError:
+                        pass
+        else:
+            time.sleep(0.001)
+    return None
+
+
 def _upload(fh, data):
-    """Reliable base64 lock-step upload (~13 s). The binary fast-path is WIP — the
-    firmware's binReceiving drain doesn't pick up bytes that demonstrably reach the
-    line path (a TinyUSB-CDC quirk needing on-device serial-monitor debugging)."""
+    """Chunk-acked binary upload (~2.5 s vs ~13 s base64). Each {"op":"binchunk"}
+    line is followed by exactly CHUNK raw bytes; the device reads them into RAM
+    (no flash → its 8 KB RX queue can't overflow), commits the chunk to flash while
+    the host waits, then acks. Reads and flash writes never overlap, so a slow
+    LittleFS write can't make macOS time out and silently drop bytes."""
     crc = zlib.crc32(data) & 0xFFFFFFFF
-    _send(fh, {"sprite": {"op": "begin", "name": _NAME, "size": len(data)}})
+    _send(fh, {"sprite": {"op": "binbegin", "name": _NAME, "size": len(data)}})
     if not (_read_ack(fh) or {}).get("ok"):
         return False
-    for i, off in enumerate(range(0, len(data), _CHUNK)):
-        _send(fh, {"sprite": {"op": "data", "seq": i,
-                              "data": base64.b64encode(data[off:off + _CHUNK]).decode("ascii")}})
-        if not (_read_ack(fh) or {}).get("ok"):
-            return False
+    for off in range(0, len(data), _CHUNK):
+        chunk = data[off:off + _CHUNK]
+        _send(fh, {"sprite": {"op": "binchunk", "len": len(chunk)}})
+        _write_all(fh, chunk)
+        b = _read_binack(fh)
+        if not b or not b.get("ok"):
+            return False  # device aborts on a bad chunk; leave track_id uncached to retry
     _send(fh, {"sprite": {"op": "end", "name": _NAME, "crc32": crc}})
     if not (_read_ack(fh, 3) or {}).get("ok"):
         return False
