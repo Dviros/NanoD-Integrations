@@ -145,6 +145,23 @@ def get_nowplaying(player="Music"):
             "position": None, "duration": None, "playing": True}
 
 
+def get_track_meta(player="Music"):
+    """Cheap now-playing probe — (track_id, position_s, duration_s) WITHOUT fetching
+    artwork; None when nothing is playing. track_id matches get_nowplaying's so the
+    caller can detect track changes without the expensive cover export each poll."""
+    if player == "Music":
+        r = _applescript_track("Music")
+    elif player == "Spotify":
+        r = _applescript_track("Spotify", dur_ms=True)
+    else:
+        name, artist = _window_title(player)
+        return (f"{name}\t{artist}", None, None) if name else None
+    if not r:
+        return None
+    name, artist, album, pos, dur = r
+    return (f"{name}\t{artist}\t{album}", pos, dur)
+
+
 if __name__ == "__main__":
     import sys
     pl = sys.argv[1] if len(sys.argv) > 1 else "Music"

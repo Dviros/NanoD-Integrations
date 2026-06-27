@@ -31,7 +31,7 @@ import zlib
 import numpy as np
 from PIL import Image
 
-from nowplaying import get_nowplaying
+from nowplaying import get_nowplaying, get_track_meta
 
 _HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nowplaying-art")
 _DIM = 240                 # device screen
@@ -196,12 +196,20 @@ def _upload(fh, data):
 # ── public API ─────────────────────────────────────────────────────────────────
 
 def push_artstream(fh, last={}, *, player="Music", ring=True):  # noqa: B006 — persistent state
-    info = get_nowplaying(player)
-    if not info:
+    # Cheap probe first (no artwork export): drives the seek arc every poll and tells
+    # us whether the track changed — only then do we pay for the cover fetch + upload.
+    meta = get_track_meta(player)
+    if not meta:
         return False
-    track_id, art = info["track_id"], info["art"]
+    track_id, pos, dur = meta
+    if dur and pos is not None:
+        _send(fh, {"seek": {"pos": max(0.0, min(1.0, pos / dur))}})
     if last.get("track_id") == track_id:
         return False
+    info = get_nowplaying(player)            # track changed → fetch the cover (expensive)
+    if not info:
+        return False
+    art = info["art"]
     try:
         data, cols = _render(art)
         if not _upload(fh, data):

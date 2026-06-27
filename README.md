@@ -7,11 +7,22 @@ Documentation and integration resources for the [Binaris Nano_D++](https://store
 [SERIAL_API.md](SERIAL_API.md) is the authoritative reference for the JSON protocol used to configure and control the device. It covers:
 
 - Serial (USB-CDC) and WebSocket (WiFi build) transports
-- Full command set: profiles, motor, settings, display, WiFi, and sprite commands
+- Full command set: profiles, motor, settings, display, WiFi, sprite commands, LED ring palette (`ring`), song progress arc (`seek`), and ROM download reboot (`reboot`)
+- Binary chunk-acked sprite upload path (used by the music profile — approximately 2.5 s for a 240×240 RGB565 frame)
 - ACK message shapes and error handling
 - Event messages: key events, knob telemetry (`a`/`t`/`v`), idle heartbeat
 - Integration patterns: connection sequence, event dispatch, saving state
 - Power delivery (USB-PD via STUSB4500) and build environments
+
+## macOS Companion
+
+[macos/README.md](macos/README.md) documents the Python/Swift host-side scripts:
+
+- `nanod-bridge.py` — config-driven serial bridge (buttons, volume, artwork)
+- `artstream.py` — no-PSRAM music profile: album art on screen, LED ring in album colors, seek arc
+- `nowplaying.py` — now-playing for Apple Music and Spotify via AppleScript; best-effort for other players
+- `volctl.swift` — persistent CoreAudio volume helper (~1 ms per change; build with `swiftc -O`)
+- `flash.sh` — buttonless firmware flash via `{"reboot":"bootloader"}` + esptool
 
 ## ZERO/ONE Configuration Suite
 

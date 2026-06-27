@@ -39,7 +39,8 @@ The companion app writes this file; the bridge reads it at startup and re-reads 
 {
   "buttons": ["playpause", "next", "previous", "mute"],
   "knobVolume": true,
-  "artwork": false
+  "artwork": false,
+  "player": "Music"
 }
 ```
 
@@ -49,7 +50,8 @@ The companion app writes this file; the bridge reads it at startup and re-reads 
 |--------------|-----------|--------------------------------------------|-------------|
 | `buttons`    | `string[]`| `["playpause","next","previous","mute"]`   | Action for each button (index 0–3 = A–D) |
 | `knobVolume` | `bool`    | `true`                                     | Knob position drives macOS output volume |
-| `artwork`    | `bool`    | `false`                                    | Push album art to device screen (requires artwork agent) |
+| `artwork`    | `bool`    | `false`                                    | Enable music profile: album art on screen, LED ring in album colors, seek arc. Requires `Pillow` and `numpy`. |
+| `player`     | `string`  | `"Music"`                                  | Now-playing source: `"Music"`, `"Spotify"`, or any app name for best-effort window-title mode (no seek). |
 
 ### Allowed button action strings
 
@@ -106,18 +108,111 @@ rm ~/Library/LaunchAgents/com.nanod.bridge.plist
 
 ---
 
+## Music profile — album art, seek arc, and ring glow
+
+When `artwork` is `true` in `bridge.json`, the bridge runs a music profile that covers three behaviors:
+
+### Album artwork on the display (`artstream.py`)
+
+The Nano_D++ has **no PSRAM**, so the device cannot decode or buffer a full-screen image in RAM. The Mac does all the work: `artstream.py` decodes the current album cover, center-crops it to square, resizes it to 240×240, and converts it to a raw RGB565 frame (115 200 bytes). That frame is uploaded to the device as the sprite `art.rgb565`, which the firmware streams straight from flash to the GC9A01 LCD in strips — the image never occupies device RAM.
+
+**Binary chunk-acked upload protocol** — the upload uses a firmware-side binary mode rather than base64:
+
+1. Send `{"sprite":{"op":"binbegin","name":"art.rgb565","size":<bytes>}}`; wait for `{"ack":"sprite","ok":true}`.
+2. For each 4 KB block: send `{"sprite":{"op":"binchunk","len":<n>}}`; send the raw bytes immediately after; wait for `{"binack":{"ok":true}}`.
+3. Send `{"sprite":{"op":"end","name":"art.rgb565","crc32":<ieee-crc32>}}`; wait for final `{"ack":"sprite","ok":true}`.
+4. Deselect then re-select: `{"sprite":{"op":"select","name":""}}` → `{"sprite":{"op":"select","name":"art.rgb565"}}` so the firmware detects the change and re-streams the frame.
+
+Upload time is approximately 2.5 s. The lock-step (send chunk header, send bytes, wait for `binack`) is required: firing ahead overruns the device's 8 KB CDC RX queue and causes a size-mismatch abort.
+
+Fallback if `artstream.py` or its Python dependencies (`Pillow`, `numpy`) are absent: the bridge skips artwork silently and logs a one-time warning.
+
+### LED ring glow (`{"ring":...}`)
+
+After uploading the frame, `artstream.py` extracts the two dominant vivid colors from the cover and sends them to the LED ring:
+
+```json
+{"ring": {"primary": 16730458, "secondary": 4654093, "mode": 0}}
+```
+
+Colors are 24-bit RGB integers (`0xRRGGBB`). Near-black and near-white are skipped to keep the glow visually interesting.
+
+### Song progress arc (`{"seek":...}`)
+
+Every poll (every ~2 s by default), `artstream.py` fetches the current player position and sends:
+
+```json
+{"seek": {"pos": 0.42}}
+```
+
+`pos` is a normalized float `0.0`–`1.0` (`position / duration`). The firmware draws a progress arc on the LED ring. This is sent cheaply without re-fetching artwork; only a track-ID change triggers the full cover upload.
+
+### Now-playing sources (`nowplaying.py`)
+
+`nowplaying.py` provides track metadata and artwork for the players configured in `bridge.json`. macOS MediaRemote is locked down on macOS 14.4+ / macOS 26 (returns empty for unsigned apps), so the bridge reads each player directly via AppleScript.
+
+| Player value | Metadata source | Artwork source | Seek |
+|---|---|---|---|
+| `"Music"` | AppleScript (`name`, `artist`, `album`, `player position`, `duration`) | `data of artwork 1 of current track` (raw bytes) | yes |
+| `"Spotify"` | AppleScript (same terms; duration in ms, converted) | `artwork url of current track` | yes |
+| `"<AppName>"` (other) | Window title parsed as `"Song — Artist"` | iTunes Search API by track name (best-effort) | no |
+
+For Music and Spotify, the iTunes Search API is an additional cover fallback when the primary source fails.
+
+**Two entry points** — use the right one to avoid unnecessary artwork exports:
+
+- `get_nowplaying(player)` — fetches track metadata **and** artwork. Returns `{track_id, art, position, duration, playing}`. Call only when the track changes.
+- `get_track_meta(player)` — returns `(track_id, position_s, duration_s)` **without** fetching artwork. Call every poll to drive the seek arc and detect track changes cheaply.
+
+### Dependencies
+
+```sh
+pip3 install Pillow numpy
+```
+
+These are only required when `"artwork": true`. The rest of the bridge (`nanod-bridge.py`) has no pip dependencies.
+
+---
+
+## Real-time volume control (`volctl.swift`)
+
+The bridge spawns a persistent Swift helper (`volctl`) to set macOS output volume via CoreAudio (`AudioObjectSetPropertyData` / `kAudioDevicePropertyVolumeScalar`). The helper reads a target volume (0–100, one integer per line) on stdin and applies it in approximately 1 ms — versus approximately 50–80 ms to spawn a new `osascript` process for every knob tick. This makes the knob feel instantaneous when turning.
+
+**Build:**
+```sh
+swiftc -O integ/macos/volctl.swift -o integ/macos/volctl
+```
+
+The bridge looks for the binary at `integ/macos/volctl` (next to `nanod-bridge.py`). If absent, it falls back to `osascript` with a one-time log warning. The helper handles both devices that expose a master volume scalar and devices that require per-channel (L/R) scalars.
+
+---
+
+## Buttonless flashing (`flash.sh`)
+
+`integ/macos/flash.sh` flashes new firmware without the BOOT+EN button dance.
+
+**How it works:**
+
+1. Sends `{"reboot":"bootloader"}` over serial — the running firmware drops into ROM download mode immediately, no buttons needed.
+2. Waits (up to ~20 s) for the device to re-enumerate as a download-mode port and probes it with `esptool`.
+3. Flashes with `esptool.py` (`--before no_reset --after no_reset`; esptool cannot reset a native-USB ESP32-S3 board via RTS).
+4. Prints a reminder to tap EN once — the device cannot self-reset after flashing.
+
+**Usage:**
+```sh
+./flash.sh                          # uses fw/.pio/build/nanofoc_d_wifi/firmware.bin
+./flash.sh path/to/firmware.bin     # explicit firmware path
+```
+
+`esptool.py` is located from the PlatformIO toolchain (`~/.platformio/packages/tool-esptoolpy/`). If the firmware JSON command fails (e.g., device is already unplugged), the script prints the manual fallback: hold BOOT, tap EN, release BOOT.
+
+---
+
 ## Artwork agent hook
 
-The bridge contains a no-op stub `push_artwork(image_path: str)` in `nanod-bridge.py`. The artwork agent imports or monkey-patches this function to push album art to the device screen using the sprite protocol:
+The bridge imports `artstream.push_artstream` directly when `Pillow` and `numpy` are available. The active serial file handle is stored as `_active_port` in the bridge module namespace and is passed directly into `push_artstream` for lock-step binary writes.
 
-```
-{"sprite":{"op":"begin","name":<n>,"size":<bytes>}}
-N × {"op":"data","seq":<i>,"data":<base64_chunk>}
-{"op":"end","name":<n>,"crc32":<uint32>}
-{"op":"select","name":<n>}
-```
-
-Constraints: `MAX_SPRITE_SIZE` = 64 KB, screen = 240×240 round, PNG/BMP only (GIF is unsafe — hangs LCD task). The active serial file object is exposed as `nanod_bridge._active_port`.
+Constraints: `MAX_SPRITE_SIZE` = 64 KB, screen = 240×240 round, raw RGB565 only (GIF decode hangs the LCD task — do not use GIF sprites).
 
 ---
 

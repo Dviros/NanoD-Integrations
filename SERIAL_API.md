@@ -424,9 +424,101 @@ To disable WiFi:
 
 ---
 
+### LED ring commands
+
+#### Set ring colors (music profile glow)
+
+Sets the active LED ring palette. Sent by the music profile after extracting dominant album-cover colors. `primary` and `secondary` are 24-bit RGB integers (`0xRRGGBB`). `mode` is reserved for future use; pass `0`.
+
+```json
+{"ring": {"primary": 16730458, "secondary": 4654093, "mode": 0}}
+```
+
+ACK: `{"ack":"ring","ok":true}`
+
+---
+
+### Seek arc commands
+
+#### Set song progress arc
+
+Updates the LED ring progress arc for the currently playing track. `pos` is a normalized float in `[0.0, 1.0]` (`position_seconds / duration_seconds`). Sent every poll interval by the music profile.
+
+```json
+{"seek": {"pos": 0.42}}
+```
+
+ACK: `{"ack":"seek","ok":true}`
+
+---
+
+### System commands
+
+#### Reboot into ROM download mode
+
+Drops the running firmware into the ESP32-S3 ROM download mode. Used by `flash.sh` to avoid the BOOT+EN button combination when reflashing. After flashing, the device cannot self-reset (native USB has no RTS reset wiring); tap EN once to boot the new firmware.
+
+```json
+{"reboot": "bootloader"}
+```
+
+No ACK is sent; the device reboots immediately.
+
+---
+
 ### Sprite commands
 
 Sprites are images stored in LittleFS at `/sprites/<name>`. They are accessible to LVGL via the `L:` filesystem driver letter (e.g. `L:/sprites/myimage.bmp`). Maximum 16 sprites, 64 KB per sprite, 512 KB total.
+
+The sprite protocol supports two upload paths: a **base64 chunked** path (JSON throughout) and a **binary chunk-acked** path (used by the music profile). Both paths end with the same `end` and `select` operations.
+
+#### Binary upload path (recommended for large sprites)
+
+The binary path avoids base64 overhead — a 240×240 RGB565 frame (115 200 bytes) uploads in approximately 2.5 s vs approximately 13 s via base64. Each chunk is acknowledged before the next is sent; the lock-step prevents overrunning the device's 8 KB CDC RX queue.
+
+**Begin binary upload**
+
+```json
+{"sprite": {"op": "binbegin", "name": "art.rgb565", "size": 115200}}
+```
+
+`size` is the total unencoded byte count. ACK: `{"ack":"sprite","ok":true}`.
+
+**Send a binary chunk**
+
+Send the JSON header line, then write the raw bytes immediately after (no newline between them):
+
+```json
+{"sprite": {"op": "binchunk", "len": 4096}}
+<4096 raw bytes>
+```
+
+Wait for the device to commit the chunk to flash and respond before sending the next chunk:
+
+```json
+{"binack": {"ok": true}}
+```
+
+`len` must equal the actual byte count sent. A mismatch or timeout aborts the upload.
+
+**End and commit**
+
+Same `end` command as the base64 path — CRC-32 covers the full unencoded file:
+
+```json
+{"sprite": {"op": "end", "name": "art.rgb565", "crc32": 3735928559}}
+```
+
+ACK: `{"ack":"sprite","ok":true}` or `{"ack":"sprite","ok":false,"error":"CRC mismatch"}`
+
+After committing, deselect then re-select so the firmware detects the new frame:
+
+```json
+{"sprite": {"op": "select", "name": ""}}
+{"sprite": {"op": "select", "name": "art.rgb565"}}
+```
+
+#### Base64 upload path (legacy / small sprites)
 
 The sprite protocol uses a chunked upload state machine: `begin` opens a transfer, one or more `data` chunks carry base64-encoded bytes, and `end` validates the CRC-32 and commits the file.
 
@@ -506,7 +598,10 @@ ACK: `{"ack":"sprite","ok":true}` or `{"ack":"sprite","ok":false,"error":"not fo
 | `message: {...}` | host→device | yes | `message` | Show message screen |
 | `screen: {...}` | host→device | no | — | Raw LCD layout update |
 | `wifi: {...}` | host→device | yes | `wifi` | WiFi credentials / toggle |
-| `sprite: {...}` | host→device | yes | `sprite` | Sprite store operations |
+| `sprite: {...}` | host→device | yes | `sprite` | Sprite store operations (base64 and binary paths) |
+| `ring: {...}` | host→device | yes | `ring` | Set LED ring palette (music profile) |
+| `seek: {"pos":…}` | host→device | yes | `seek` | Set song progress arc (0.0–1.0) |
+| `reboot: "bootloader"` | host→device | yes | — | Drop into ROM download mode (no ACK; device reboots) |
 
 ---
 
