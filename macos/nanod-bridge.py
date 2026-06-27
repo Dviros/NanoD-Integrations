@@ -31,9 +31,10 @@ import subprocess
 import sys
 import time
 
-# Artwork module — optional; gracefully absent if not yet deployed.
+# Artwork module — no-PSRAM RGB565 streaming + album-color ring glow.
+# Optional; gracefully absent if Pillow/numpy or the module aren't present.
 try:
-    from artwork import push_artwork as _push_artwork_impl
+    from artstream import push_artstream as _push_artwork_impl
     _ARTWORK_AVAILABLE = True
 except ImportError:
     _ARTWORK_AVAILABLE = False
