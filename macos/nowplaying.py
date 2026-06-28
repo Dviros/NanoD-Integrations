@@ -18,13 +18,25 @@ get_nowplaying(player) -> dict | None
 The Mac does all the work; the device just streams the result.
 """
 
+import glob
+import hashlib
 import json
 import os
+import ssl
 import subprocess
 import urllib.parse
 import urllib.request
 
 _ART = f"/tmp/nanod-art-{os.getpid()}.dat"
+
+# SSL context for cover downloads: prefer certifi's CA bundle, fall back to an
+# unverified context. These are public album-art images (not sensitive data), and
+# the stock macOS python3 often lacks a usable CA bundle (CERTIFICATE_VERIFY_FAILED).
+try:
+    import certifi
+    _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+except Exception:
+    _SSL_CTX = ssl._create_unverified_context()
 
 
 def _osa(script, timeout=3):
@@ -105,16 +117,69 @@ def _itunes_cover(name, artist):
 
 
 def _fetch(url):
-    try:
-        urllib.request.urlretrieve(url, _ART)
-        return os.path.getsize(_ART) > 100
-    except (urllib.error.URLError, OSError):
+    if not url:
         return False
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8, context=_SSL_CTX) as r:
+            data = r.read()
+        if len(data) < 100:
+            return False
+        with open(_ART, "wb") as f:
+            f.write(data)
+        return True
+    except Exception:
+        return False
+
+
+# ── Kaset (YouTube Music) ───────────────────────────────────────────────────────
+# Kaset keeps its now-playing locked inside WebKit: no AppleScript track terms,
+# MediaRemote is locked on macOS 26, its AX tree is empty, and its prefs only save
+# on quit (stale during a session). BUT it caches album covers to disk live. We use
+# the newest cover-sized (>=400px, ~square) image in its image cache as the cover.
+# Cover only — no track name, and no live position, so no seek bar for Kaset.
+
+_KASET_IMGCACHE = os.path.expanduser(
+    "~/Library/Containers/com.sertacozercan.Kaset/Data/Library/Caches/com.kaset.imagecache")
+
+
+def _kaset_cover():
+    """Return (path, md5) of Kaset's current cover (newest cover-sized cached image),
+    or (None, None) if Kaset isn't running / no cover is cached. The md5 is the
+    change key — it flips when the displayed cover changes (i.e. on track change)."""
+    try:
+        if subprocess.run(["pgrep", "-x", "Kaset"], capture_output=True, timeout=2).returncode != 0:
+            return None, None
+        from PIL import Image
+        files = sorted(((os.path.getmtime(x), x)
+                        for x in glob.glob(_KASET_IMGCACHE + "/**/*", recursive=True)
+                        if os.path.isfile(x)), reverse=True)
+        for _, x in files[:25]:                     # newest first; covers are large squares
+            try:
+                w, h = Image.open(x).size
+            except Exception:
+                continue
+            if min(w, h) >= 400 and 0.8 < w / h < 1.25:
+                return x, hashlib.md5(open(x, "rb").read()).hexdigest()
+    except Exception:
+        pass
+    return None, None
 
 
 # ── public ─────────────────────────────────────────────────────────────────────
 
 def get_nowplaying(player="Music"):
+    if player == "Kaset":
+        path, h = _kaset_cover()
+        if not path:
+            return None
+        try:
+            with open(path, "rb") as s, open(_ART, "wb") as d:
+                d.write(s.read())
+        except OSError:
+            return None
+        return {"track_id": h, "art": _ART, "position": None, "duration": None, "playing": True}
+
     if player == "Music":
         r = _applescript_track("Music")
         if not r:
@@ -149,6 +214,9 @@ def get_track_meta(player="Music"):
     """Cheap now-playing probe — (track_id, position_s, duration_s) WITHOUT fetching
     artwork; None when nothing is playing. track_id matches get_nowplaying's so the
     caller can detect track changes without the expensive cover export each poll."""
+    if player == "Kaset":
+        _, h = _kaset_cover()
+        return (h, None, None) if h else None
     if player == "Music":
         r = _applescript_track("Music")
     elif player == "Spotify":

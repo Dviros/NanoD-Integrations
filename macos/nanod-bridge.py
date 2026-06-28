@@ -129,14 +129,43 @@ def set_volume(vol: int) -> None:
         _volctl = None  # respawn next call
 
 
-def media(verb: str) -> None:
-    """
-    Send an AppleScript verb to whichever of Kaset / Spotify / Music is running.
-    Kaset supports: playpause, next track, previous track
-    (No track-property or artwork access on Kaset.)
-    """
-    for app in ("Kaset", "Spotify", "Music"):
-        osa(f'if application "{app}" is running then tell application "{app}" to {verb}')
+_MEDIAKEY_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mediakey")
+
+
+def media_key(cmd: str) -> None:
+    """Post a macOS media key (playpause/next/previous). App-agnostic — controls
+    whatever is playing (Kaset/YouTube Music, Spotify, Music). Needs Accessibility
+    permission for the launching process. Falls back to AppleScript if the helper
+    is missing (works for scriptable players; Kaset is not one)."""
+    try:
+        subprocess.Popen([_MEDIAKEY_BIN, cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        verb = {"playpause": "playpause", "next": "next track", "previous": "previous track"}.get(cmd)
+        if verb:
+            for app in ("Kaset", "Spotify", "Music"):
+                osa(f'if application "{app}" is running then tell application "{app}" to {verb}')
+
+
+def media_control(action: str) -> None:
+    """Play/pause/next/previous, routed by the configured player:
+      • Kaset  — click its Playback menu via System Events (Kaset has no AppleScript
+        API, and synthetic media keys don't reach it — it uses MPRemoteCommandCenter).
+        Needs Accessibility permission for whatever launches the bridge.
+      • Music / Spotify — AppleScript.
+      • anything else — generic media keys (best-effort)."""
+    player = get_config().get("player", "Music")
+    if player == "Kaset":
+        target = {"playpause": "menu item 1", "next": 'menu item "Next"',
+                  "previous": 'menu item "Previous"'}.get(action)
+        if target:
+            osa(f'tell application "System Events" to tell process "Kaset" '
+                f'to click {target} of menu 1 of menu bar item "Playback" of menu bar 1')
+    elif player in ("Music", "Spotify"):
+        verb = {"playpause": "playpause", "next": "next track", "previous": "previous track"}.get(action)
+        if verb:
+            osa(f'if application "{player}" is running then tell application "{player}" to {verb}')
+    else:
+        media_key(action)
 
 
 # ---------------------------------------------------------------------------
@@ -147,12 +176,8 @@ def run_button_action(action: str) -> None:
     """Dispatch a single button action string. Non-blocking."""
     if not action or action == "none":
         return
-    if action == "playpause":
-        media("playpause")
-    elif action == "next":
-        media("next track")
-    elif action == "previous":
-        media("previous track")
+    if action in ("playpause", "next", "previous"):
+        media_control(action)
     elif action == "mute":
         osa("set volume output muted (not (output muted of (get volume settings)))")
     elif action == "volup":
