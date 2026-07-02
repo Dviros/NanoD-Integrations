@@ -106,7 +106,7 @@ def _itunes_cover(name, artist):
     try:
         term = urllib.parse.quote(f"{artist} {name}".strip())
         url = f"https://itunes.apple.com/search?term={term}&entity=song&limit=1"
-        with urllib.request.urlopen(url, timeout=5) as r:
+        with urllib.request.urlopen(url, timeout=5, context=_SSL_CTX) as r:
             res = json.loads(r.read()).get("results")
         if not res:
             return False
@@ -130,6 +130,22 @@ def _fetch(url):
         return True
     except Exception:
         return False
+
+
+def _art_is_image():
+    """Verify _ART actually decodes as an image (CDNs return HTML error pages with
+    HTTP 200; without this the renderer chokes downstream and the cover/ring silently
+    freeze on the previous track)."""
+    try:
+        from PIL import Image
+        Image.open(_ART).verify()
+        return True
+    except Exception:
+        return False
+
+
+def _fetch_image(url):
+    return _fetch(url) and _art_is_image()
 
 
 # ── Kaset (YouTube Music) ───────────────────────────────────────────────────────
@@ -192,9 +208,18 @@ def _kaset_session():
 def get_nowplaying(player="Music"):
     if player == "Kaset":
         cur, _, _ = _kaset_session()
-        if not cur or not cur.get("thumbnailURL"):
+        if not cur:
             return None
-        if not _fetch(_kaset_cover_url(cur["thumbnailURL"])):
+        # Cover chain (each validated as a real image):
+        #   1. plist thumbnailURL, 544px-normalized  2. thumbnailURL untouched
+        #   3. iTunes Search by title+artist — some queue entries carry a junk
+        #      thumbnailURL (literally "https://music.youtube.com/"), an HTML page.
+        url = cur.get("thumbnailURL") or ""
+        artist = (cur.get("artists") or [{}])[0].get("name", "")
+        ok = (_fetch_image(_kaset_cover_url(url)) or _fetch_image(url)) if url else False
+        if not ok:
+            ok = _itunes_cover(cur.get("title", ""), artist) and _art_is_image()
+        if not ok:
             return None
         # position/duration omitted: Kaset writes `progress` only intermittently, so
         # any live estimate overshoots — no reliable seek. Ring shows the album glow.
