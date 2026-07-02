@@ -219,6 +219,7 @@ def on_key(index: int) -> None:
 _artwork_state: dict = {}          # track-ID cache persisted across calls
 _last_art_check: float = 0.0
 _ART_INTERVAL = 2.0                # seconds between now-playing polls
+_last_boot_sig = None              # de-dupe the device {"boot"} diagnostic in the log
 
 
 def _artwork_send_line(line: str) -> None:
@@ -229,6 +230,17 @@ def _artwork_send_line(line: str) -> None:
         _active_port.write((line + "\n").encode())
     except OSError as exc:
         print(f"[art] serial write error: {exc}", flush=True)
+
+
+def _inline_event(obj: dict) -> None:
+    """Handle knob/button events that arrive DURING an artwork upload — artstream's
+    ack-reader forwards them here, so a 3-8s cover push no longer freezes volume
+    or drops button presses."""
+    if "p" in obj and isinstance(obj["p"], (int, float)):
+        if get_config().get("knobVolume", True):
+            set_volume(max(0, min(100, int(obj["p"]))))
+    if "kd" in obj and isinstance(obj["kd"], int):
+        on_key(obj["kd"])
 
 
 def maybe_push_artwork(now: float) -> None:
@@ -248,11 +260,12 @@ def maybe_push_artwork(now: float) -> None:
     _last_art_check = now
     try:
         # push_artstream drives the port directly (lock-step upload reading acks).
-        # The main loop is paused inside this call, so there's no read contention;
-        # knob/button events during the ~13 s upload are dropped (Phase 3 fixes speed).
+        # Knob/button events seen by its ack-reader are forwarded to _inline_event,
+        # so the device stays responsive through the upload.
         t0 = time.time()
         if _push_artwork_impl(_active_port, last=_artwork_state,
-                              player=get_config().get("player", "Music")):
+                              player=get_config().get("player", "Music"),
+                              on_line=_inline_event):
             print(f"[art] cover streamed in {time.time() - t0:.1f}s", flush=True)
     except Exception as exc:
         print(f"[art] push error: {exc}", flush=True)
@@ -323,6 +336,12 @@ def main() -> None:
                         try:
                             obj = json.loads(line)
                         except Exception:
+                            # Non-JSON output = boot logs, WiFi messages, and CRUCIALLY
+                            # panic/backtrace text after a crash. Log it — this is the
+                            # evidence trail for any device reset.
+                            txt = line.decode("utf-8", "replace").strip()
+                            if txt:
+                                print(f"[device] {txt}", flush=True)
                             continue
 
                         # Knob position -> volume
@@ -333,6 +352,27 @@ def main() -> None:
                         # Button down
                         if "kd" in obj and isinstance(obj["kd"], int):
                             on_key(obj["kd"])
+
+                        # Boot diagnostic: reset reason + negotiated PD voltage. Logged
+                        # once per distinct boot so a crash's cause (PANIC vs BROWNOUT vs
+                        # TASK_WDT) lands in the log automatically.
+                        if isinstance(obj.get("boot"), dict):
+                            sig = (obj["boot"].get("reason"), obj["boot"].get("pd_v"))
+                            global _last_boot_sig, _last_art_check
+                            if sig != _last_boot_sig:
+                                _last_boot_sig = sig
+                                print(f"[boot] reset={obj['boot'].get('reason')} "
+                                      f"pd_v={obj['boot'].get('pd_v')} "
+                                      f"budget={obj['boot'].get('budget_ma')}mA", flush=True)
+                                # Device (re)booted — resync: forget the cached track so
+                                # the next art poll re-pushes cover + ring colors.
+                                _artwork_state.clear()
+                                _last_art_check = 0.0
+
+                        # Firmware fault (e.g. HMI-stall watchdog auto-recovery) — log it.
+                        if "fault" in obj:
+                            print(f"[fault] {obj.get('fault')} "
+                                  f"stall_ms={obj.get('stall_ms')}", flush=True)
                 else:
                     time.sleep(0.004)
 

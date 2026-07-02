@@ -18,12 +18,12 @@ get_nowplaying(player) -> dict | None
 The Mac does all the work; the device just streams the result.
 """
 
-import glob
-import hashlib
 import json
 import os
+import plistlib
 import ssl
 import subprocess
+import time
 import urllib.parse
 import urllib.request
 
@@ -133,52 +133,73 @@ def _fetch(url):
 
 
 # ── Kaset (YouTube Music) ───────────────────────────────────────────────────────
-# Kaset keeps its now-playing locked inside WebKit: no AppleScript track terms,
-# MediaRemote is locked on macOS 26, its AX tree is empty, and its prefs only save
-# on quit (stale during a session). BUT it caches album covers to disk live. We use
-# the newest cover-sized (>=400px, ~square) image in its image cache as the cover.
-# Cover only — no track name, and no live position, so no seek bar for Kaset.
+# Kaset persists its now-playing session to its app plist as JSON under the key
+# `kaset.saved.playbackSession`:
+#   {currentVideoId, currentIndex, progress, duration,
+#    queue:[{videoId, title, duration, thumbnailURL, ...}]}
+# That is the EXACT current track + its real cover URL — far better than the old
+# "newest cached image" guess, which picked the wrong cover whenever a playlist grid
+# loaded many covers at once (all with the same mtime). `progress` is only written at
+# track change (frozen at its value then), so we ESTIMATE live position as
+# progress + (now - plist_mtime): accurate during continuous playback, and it
+# self-corrects on every track change (when Kaset rewrites the plist).
 
-_KASET_IMGCACHE = os.path.expanduser(
-    "~/Library/Containers/com.sertacozercan.Kaset/Data/Library/Caches/com.kaset.imagecache")
+_KASET_PLIST = os.path.expanduser(
+    "~/Library/Containers/com.sertacozercan.Kaset/Data/Library/Preferences/com.sertacozercan.Kaset.plist")
 
 
-def _kaset_cover():
-    """Return (path, md5) of Kaset's current cover (newest cover-sized cached image),
-    or (None, None) if Kaset isn't running / no cover is cached. The md5 is the
-    change key — it flips when the displayed cover changes (i.e. on track change)."""
+def _kaset_cover_url(url):
+    """Normalize a googleusercontent thumbnail URL to a square 544px cover."""
+    i = url.rfind("=")
+    return (url[:i] if i != -1 else url) + "=w544-h544-l90-rj"
+
+
+def _kaset_session():
+    """Read Kaset's persisted now-playing session. Returns (track_dict, position_s,
+    duration_s), or (None, None, None) if Kaset isn't running / has no session."""
     try:
         if subprocess.run(["pgrep", "-x", "Kaset"], capture_output=True, timeout=2).returncode != 0:
-            return None, None
-        from PIL import Image
-        files = sorted(((os.path.getmtime(x), x)
-                        for x in glob.glob(_KASET_IMGCACHE + "/**/*", recursive=True)
-                        if os.path.isfile(x)), reverse=True)
-        for _, x in files[:25]:                     # newest first; covers are large squares
-            try:
-                w, h = Image.open(x).size
-            except Exception:
-                continue
-            if min(w, h) >= 400 and 0.8 < w / h < 1.25:
-                return x, hashlib.md5(open(x, "rb").read()).hexdigest()
+            return None, None, None
+        mtime = os.path.getmtime(_KASET_PLIST)
+        with open(_KASET_PLIST, "rb") as fh:
+            d = plistlib.load(fh)
+        raw = d.get("kaset.saved.playbackSession")
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "replace")
+        ps = json.loads(raw)
+        q = ps.get("queue") or []
+        vid = ps.get("currentVideoId")
+        cur = next((t for t in q if isinstance(t, dict) and t.get("videoId") == vid), None)
+        if cur is None:
+            ci = ps.get("currentIndex", 0)
+            cur = q[ci] if 0 <= ci < len(q) else None
+        if not cur:
+            return None, None, None
+        dur = float(ps.get("duration") or cur.get("duration") or 0) or None
+        # ponytail: position estimated from wall-clock since the plist write; drifts
+        # forward if the user pauses (Kaset doesn't update progress live). Good enough
+        # for the seek ring; resets correctly on track change.
+        pos = float(ps.get("progress") or 0) + max(0.0, time.time() - mtime)
+        if dur:
+            pos = min(pos, dur)
+        return cur, pos, dur
     except Exception:
-        pass
-    return None, None
+        return None, None, None
 
 
 # ── public ─────────────────────────────────────────────────────────────────────
 
 def get_nowplaying(player="Music"):
     if player == "Kaset":
-        path, h = _kaset_cover()
-        if not path:
+        cur, _, _ = _kaset_session()
+        if not cur or not cur.get("thumbnailURL"):
             return None
-        try:
-            with open(path, "rb") as s, open(_ART, "wb") as d:
-                d.write(s.read())
-        except OSError:
+        if not _fetch(_kaset_cover_url(cur["thumbnailURL"])):
             return None
-        return {"track_id": h, "art": _ART, "position": None, "duration": None, "playing": True}
+        # position/duration omitted: Kaset writes `progress` only intermittently, so
+        # any live estimate overshoots — no reliable seek. Ring shows the album glow.
+        return {"track_id": cur.get("videoId") or cur.get("title"),
+                "art": _ART, "position": None, "duration": None, "playing": True}
 
     if player == "Music":
         r = _applescript_track("Music")
@@ -215,8 +236,8 @@ def get_track_meta(player="Music"):
     artwork; None when nothing is playing. track_id matches get_nowplaying's so the
     caller can detect track changes without the expensive cover export each poll."""
     if player == "Kaset":
-        _, h = _kaset_cover()
-        return (h, None, None) if h else None
+        cur, _, _ = _kaset_session()
+        return (cur.get("videoId") or cur.get("title"), None, None) if cur else None
     if player == "Music":
         r = _applescript_track("Music")
     elif player == "Spotify":

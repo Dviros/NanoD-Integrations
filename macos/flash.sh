@@ -18,34 +18,53 @@ ESPTOOL="$(ls ~/.platformio/packages/tool-esptoolpy/esptool.py 2>/dev/null | hea
 port_now() { ls /dev/cu.usbmodem* 2>/dev/null | head -1; }
 
 APP_PORT="$(port_now)"
-[ -n "$APP_PORT" ] || { echo "no device port found"; exit 1; }
-echo "[flash] app port: $APP_PORT"
+if [ -n "$APP_PORT" ]; then
+    echo "[flash] app port: $APP_PORT"
+else
+    echo "[flash] no device port right now — will wait for auto/manual download mode"
+fi
 
-# 1) Ask the running firmware to reboot into ROM download mode (no buttons).
-#    Use pyserial, not a shell `>` redirect — the redirect opens/closes the tty too
-#    fast and the line often never reaches the device.
-echo "[flash] requesting download mode via {\"reboot\":\"bootloader\"} ..."
-python3 - "$APP_PORT" <<'PY' || true
+# 1+2) Ask the running firmware to reboot into ROM download mode, wait for the
+#      downloader to enumerate. The reboot command sometimes wedges USB entirely
+#      (device drops off the bus) — retry up to 3x, then fall back to waiting for
+#      a manual BOOT-hold entry.
+DL_PORT=""
+for attempt in 1 2 3; do
+    p="$(port_now)"
+    if [ -n "$p" ]; then
+        echo "[flash] attempt $attempt: requesting download mode via {\"reboot\":\"bootloader\"} ..."
+        python3 - "$p" <<'PY' || true
 import serial, sys, time
 try:
     s = serial.Serial(sys.argv[1], 115200, timeout=1)
     s.write(b'{"reboot":"bootloader"}\n'); s.flush(); time.sleep(0.2); s.close()
 except Exception as e:
-    print(f"  (reboot send failed: {e} — hold BOOT, tap EN, release BOOT to enter manually)")
+    print(f"  (reboot send failed: {e})")
 PY
-
-# 2) Wait for the device to re-enumerate as the downloader (port changes/returns).
-echo "[flash] waiting for download port ..."
-DL_PORT=""
-for _ in $(seq 1 40); do            # up to ~20 s
-    sleep 0.5
-    p="$(port_now)"
-    if [ -n "$p" ] && python3 "$ESPTOOL" --chip esp32s3 --port "$p" \
-            --before no_reset --after no_reset --connect-attempts 1 chip_id >/dev/null 2>&1; then
-        DL_PORT="$p"; break
     fi
+    for _ in $(seq 1 30); do        # up to ~15 s per attempt
+        sleep 0.5
+        p="$(port_now)"
+        if [ -n "$p" ] && python3 "$ESPTOOL" --chip esp32s3 --port "$p" \
+                --before no_reset --after no_reset --connect-attempts 1 chip_id >/dev/null 2>&1; then
+            DL_PORT="$p"; break
+        fi
+    done
+    [ -n "$DL_PORT" ] && break
 done
-[ -n "$DL_PORT" ] || { echo "[flash] download port never appeared — hold BOOT, tap EN, release BOOT, retry"; exit 1; }
+if [ -z "$DL_PORT" ]; then
+    echo "[flash] auto-entry failed. MANUAL: unplug USB → hold BOOT → plug in while holding → release."
+    echo "[flash] waiting up to 60 s for manual download mode ..."
+    for _ in $(seq 1 120); do
+        sleep 0.5
+        p="$(port_now)"
+        if [ -n "$p" ] && python3 "$ESPTOOL" --chip esp32s3 --port "$p" \
+                --before no_reset --after no_reset --connect-attempts 1 chip_id >/dev/null 2>&1; then
+            DL_PORT="$p"; break
+        fi
+    done
+fi
+[ -n "$DL_PORT" ] || { echo "[flash] no download port — giving up"; exit 1; }
 echo "[flash] download port: $DL_PORT"
 
 # 3) Flash (leave the chip in download mode; it can't self-reset on native USB).

@@ -106,7 +106,11 @@ def _send(fh, obj):
     fh.write((json.dumps(obj) + "\n").encode())
 
 
-def _read_ack(fh, timeout=1.5):
+def _wait_line(fh, key, timeout, on_line=None):
+    """Wait for a JSON line whose object has `key`. Other JSON lines (knob {"p"},
+    button {"kd"} events arriving DURING the upload) are forwarded to on_line so a
+    3-8s cover push no longer freezes volume/buttons. Consumes the stream properly:
+    each complete line is handled exactly once, the trailing partial is kept."""
     buf = b""
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -114,17 +118,28 @@ def _read_ack(fh, timeout=1.5):
             d = fh.read(4096)
         except (BlockingIOError, OSError):
             d = None
-        if d:
-            buf += d
-            for ln in buf.split(b"\n"):
-                if b'"ack"' in ln:
-                    try:
-                        return json.loads(ln)
-                    except ValueError:
-                        pass
-        else:
-            time.sleep(0.002)
+        if not d:
+            time.sleep(0.001)
+            continue
+        buf += d
+        while b"\n" in buf:
+            ln, buf = buf.split(b"\n", 1)
+            try:
+                o = json.loads(ln)
+            except ValueError:
+                continue
+            if isinstance(o, dict) and key in o:
+                return o
+            if on_line and isinstance(o, dict):
+                try:
+                    on_line(o)
+                except Exception:
+                    pass
     return None
+
+
+def _read_ack(fh, timeout=1.5, on_line=None):
+    return _wait_line(fh, "ack", timeout, on_line)
 
 
 def _write_all(fh, data):
@@ -142,29 +157,13 @@ def _write_all(fh, data):
             time.sleep(0.001)   # OS buffer full — device still draining; back off
 
 
-def _read_binack(fh, timeout=2.0):
+def _read_binack(fh, timeout=2.0, on_line=None):
     """Wait for a {"binack":{...}} line; returns the inner object or None."""
-    buf = b""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            d = fh.read(4096)
-        except (BlockingIOError, OSError):
-            d = None
-        if d:
-            buf += d
-            for ln in buf.split(b"\n"):
-                if b'"binack"' in ln:
-                    try:
-                        return json.loads(ln).get("binack")
-                    except ValueError:
-                        pass
-        else:
-            time.sleep(0.001)
-    return None
+    o = _wait_line(fh, "binack", timeout, on_line)
+    return o.get("binack") if o else None
 
 
-def _upload(fh, data):
+def _upload(fh, data, on_line=None):
     """Chunk-acked binary upload (~2.5 s vs ~13 s base64). Each {"op":"binchunk"}
     line is followed by exactly CHUNK raw bytes; the device reads them into RAM
     (no flash → its 8 KB RX queue can't overflow), commits the chunk to flash while
@@ -172,30 +171,30 @@ def _upload(fh, data):
     LittleFS write can't make macOS time out and silently drop bytes."""
     crc = zlib.crc32(data) & 0xFFFFFFFF
     _send(fh, {"sprite": {"op": "binbegin", "name": _NAME, "size": len(data)}})
-    if not (_read_ack(fh) or {}).get("ok"):
+    if not (_read_ack(fh, on_line=on_line) or {}).get("ok"):
         return False
     for off in range(0, len(data), _CHUNK):
         chunk = data[off:off + _CHUNK]
         _send(fh, {"sprite": {"op": "binchunk", "len": len(chunk)}})
         _write_all(fh, chunk)
-        b = _read_binack(fh)
+        b = _read_binack(fh, on_line=on_line)
         if not b or not b.get("ok"):
             return False  # device aborts on a bad chunk; leave track_id uncached to retry
     _send(fh, {"sprite": {"op": "end", "name": _NAME, "crc32": crc}})
-    if not (_read_ack(fh, 3) or {}).get("ok"):
+    if not (_read_ack(fh, 3, on_line=on_line) or {}).get("ok"):
         return False
     # Re-select even when the name is unchanged: deselect first so the firmware's
     # activeSprite poll sees a change and re-streams the new frame.
     _send(fh, {"sprite": {"op": "select", "name": ""}})
-    _read_ack(fh)
+    _read_ack(fh, on_line=on_line)
     _send(fh, {"sprite": {"op": "select", "name": _NAME}})
-    _read_ack(fh)
+    _read_ack(fh, on_line=on_line)
     return True
 
 
 # ── public API ─────────────────────────────────────────────────────────────────
 
-def push_artstream(fh, last={}, *, player="Music", ring=True):  # noqa: B006 — persistent state
+def push_artstream(fh, last={}, *, player="Music", ring=True, on_line=None):  # noqa: B006 — persistent state
     # Cheap probe first (no artwork export): drives the seek arc every poll and tells
     # us whether the track changed — only then do we pay for the cover fetch + upload.
     meta = get_track_meta(player)
@@ -204,6 +203,8 @@ def push_artstream(fh, last={}, *, player="Music", ring=True):  # noqa: B006 —
     track_id, pos, dur = meta
     if dur and pos is not None:
         _send(fh, {"seek": {"pos": max(0.0, min(1.0, pos / dur))}})
+    else:
+        _send(fh, {"seek": {"pos": -1}})   # no live position (e.g. Kaset) → full album ring
     if last.get("track_id") == track_id:
         return False
     info = get_nowplaying(player)            # track changed → fetch the cover (expensive)
@@ -212,7 +213,7 @@ def push_artstream(fh, last={}, *, player="Music", ring=True):  # noqa: B006 —
     art = info["art"]
     try:
         data, cols = _render(art)
-        if not _upload(fh, data):
+        if not _upload(fh, data, on_line=on_line):
             return False  # leave track_id uncached so it retries next poll
         if ring:
             _send(fh, {"ring": {"primary": cols[0], "secondary": cols[1], "mode": 0}})
