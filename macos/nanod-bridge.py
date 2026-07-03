@@ -404,4 +404,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Never die: whatever escapes main() (device unplugged mid-read, USB re-enumeration
+    # races, transient OS errors) gets logged and main() restarts. Ctrl-C still exits.
+    while True:
+        try:
+            main()
+        except KeyboardInterrupt:
+            raise SystemExit(0)
+        except Exception as exc:
+            print(f"[fatal] main() died: {exc!r} — restarting in 2s", flush=True)
+            time.sleep(2)
