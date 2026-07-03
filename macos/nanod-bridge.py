@@ -218,7 +218,7 @@ def on_key(index: int) -> None:
 
 _artwork_state: dict = {}          # track-ID cache persisted across calls
 _last_art_check: float = 0.0
-_ART_INTERVAL = 2.0                # seconds between now-playing polls
+_ART_INTERVAL = 0.5                # seconds between now-playing polls (cheap: pgrep+plist)
 _last_boot_sig = None              # de-dupe the device {"boot"} diagnostic in the log
 
 

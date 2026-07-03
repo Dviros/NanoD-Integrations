@@ -35,7 +35,7 @@ from nowplaying import get_nowplaying, get_track_meta
 
 _HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nowplaying-art")
 _DIM = 240                 # device screen
-_CHUNK = 4096              # raw bytes per chunk-acked binary block (fits the device's 8 KB RX queue)
+_CHUNK = 8192              # raw bytes per chunk-acked binary block (fits the device's 16 KB RX queue)
 _NAME = "art.rgb565"
 
 
@@ -163,16 +163,10 @@ def _read_binack(fh, timeout=2.0, on_line=None):
     return o.get("binack") if o else None
 
 
-def _upload(fh, data, on_line=None):
-    """Chunk-acked binary upload (~2.5 s vs ~13 s base64). Each {"op":"binchunk"}
-    line is followed by exactly CHUNK raw bytes; the device reads them into RAM
-    (no flash → its 8 KB RX queue can't overflow), commits the chunk to flash while
-    the host waits, then acks. Reads and flash writes never overlap, so a slow
-    LittleFS write can't make macOS time out and silently drop bytes."""
-    crc = zlib.crc32(data) & 0xFFFFFFFF
-    _send(fh, {"sprite": {"op": "binbegin", "name": _NAME, "size": len(data)}})
-    if not (_read_ack(fh, on_line=on_line) or {}).get("ok"):
-        return False
+def _send_chunks(fh, data, on_line=None):
+    """Chunk-acked body shared by both upload paths: each {"op":"binchunk"} line is
+    followed by exactly CHUNK raw bytes; the device drains them, commits (RAM or
+    flash), then acks. Lock-step keeps the 8 KB device RX queue from overflowing."""
     for off in range(0, len(data), _CHUNK):
         chunk = data[off:off + _CHUNK]
         _send(fh, {"sprite": {"op": "binchunk", "len": len(chunk)}})
@@ -180,6 +174,32 @@ def _upload(fh, data, on_line=None):
         b = _read_binack(fh, on_line=on_line)
         if not b or not b.get("ok"):
             return False  # device aborts on a bad chunk; leave track_id uncached to retry
+    return True
+
+
+def _upload(fh, data, on_line=None):
+    """Push one RGB565 frame. Preferred: RAM path ("rambegin") — no flash write, so
+    the motor keeps its detents and the upload runs at USB speed (~1-1.5 s), and the
+    frame auto-displays on "end". Falls back to the flash-sprite path when the
+    firmware is old or its RAM frame can't allocate (e.g. WiFi ate the heap)."""
+    crc = zlib.crc32(data) & 0xFFFFFFFF
+
+    _send(fh, {"sprite": {"op": "rambegin", "size": len(data)}})
+    ram_ack = _read_ack(fh, on_line=on_line) or {}
+    if ram_ack.get("ok"):
+        if not _send_chunks(fh, data, on_line=on_line):
+            return False
+        _send(fh, {"sprite": {"op": "end", "crc32": crc}})
+        return bool((_read_ack(fh, 3, on_line=on_line) or {}).get("ok"))
+    print(f"[art] ram path unavailable ({ram_ack.get('error', 'no ack')}) — flash fallback",
+          flush=True)
+
+    # Legacy flash path (writes LittleFS; the firmware parks the motor while it runs).
+    _send(fh, {"sprite": {"op": "binbegin", "name": _NAME, "size": len(data)}})
+    if not (_read_ack(fh, on_line=on_line) or {}).get("ok"):
+        return False
+    if not _send_chunks(fh, data, on_line=on_line):
+        return False
     _send(fh, {"sprite": {"op": "end", "name": _NAME, "crc32": crc}})
     if not (_read_ack(fh, 3, on_line=on_line) or {}).get("ok"):
         return False
@@ -207,14 +227,21 @@ def push_artstream(fh, last={}, *, player="Music", ring=True, on_line=None):  # 
         _send(fh, {"seek": {"pos": -1}})   # no live position (e.g. Kaset) → full album ring
     if last.get("track_id") == track_id:
         return False
+    t0 = time.time()
     info = get_nowplaying(player)            # track changed → fetch the cover (expensive)
     if not info:
         return False
+    t_fetch = time.time() - t0
     art = info["art"]
     try:
+        t0 = time.time()
         data, cols = _render(art)
+        t_render = time.time() - t0
+        t0 = time.time()
         if not _upload(fh, data, on_line=on_line):
             return False  # leave track_id uncached so it retries next poll
+        print(f"[art] fetch={t_fetch:.1f}s render={t_render:.1f}s upload={time.time()-t0:.1f}s",
+              flush=True)
         if ring:
             _send(fh, {"ring": {"primary": cols[0], "secondary": cols[1], "mode": 0}})
         last["track_id"] = track_id
